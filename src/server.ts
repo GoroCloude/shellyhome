@@ -1,6 +1,6 @@
 import express from "express";
 import path from "path";
-import { devices, PORT, DeviceConfig } from "./config";
+import { devices, PORT, SHELLY_AUTH_KEY, SHELLY_SERVER_URL, DeviceConfig } from "./config";
 
 const app = express();
 
@@ -11,38 +11,47 @@ app.get("/api/devices", (_req, res) => {
   res.json(devices.map(d => ({ id: d.id, name: d.name, type: d.type })));
 });
 
-async function fetchDeviceStatus(device: DeviceConfig) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
-
+async function fetchAllDeviceStatuses(): Promise<Map<string, any>> {
+  const result = new Map<string, any>();
   try {
-    const response = await fetch(`http://${device.ip}/status`, {
-      signal: controller.signal,
+    const response = await fetch(`${SHELLY_SERVER_URL}/device/all_status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `auth_key=${encodeURIComponent(SHELLY_AUTH_KEY)}`,
+      signal: AbortSignal.timeout(10000),
     });
     const data = await response.json();
-    return parseDeviceData(device, data);
-  } catch {
+    if (data.isok && data.data?.devices_status) {
+      for (const [cloudId, status] of Object.entries(data.data.devices_status)) {
+        result.set(cloudId, status);
+      }
+    }
+  } catch (err) {
+    console.error("Failed to fetch from Shelly Cloud:", err);
+  }
+  return result;
+}
+
+function parseDeviceData(device: DeviceConfig, cloudData: any | undefined) {
+  if (!cloudData) {
     return {
       id: device.id,
       name: device.name,
       type: device.type,
       online: false,
-      error: "Device unreachable",
+      error: "No data from cloud",
     };
-  } finally {
-    clearTimeout(timeout);
   }
-}
 
-function parseDeviceData(device: DeviceConfig, data: any) {
   if (device.type === "em3") {
-    const emeters = data.emeters || [];
+    const emeters = cloudData.emeters || [];
     const channels = emeters.map((em: any, i: number) => ({
       channel: i + 1,
       power: em.power ?? 0,
       reactive: em.reactive ?? 0,
       voltage: em.voltage ?? 0,
       current: em.current ?? 0,
+      pf: em.pf ?? 0,
       total: em.total ?? 0,
       total_returned: em.total_returned ?? 0,
     }));
@@ -54,12 +63,13 @@ function parseDeviceData(device: DeviceConfig, data: any) {
       online: true,
       totalPower,
       channels,
+      updated: cloudData._updated || null,
     };
   }
 
   // Shelly Plug S
-  const meter = data.meters?.[0] || {};
-  const relay = data.relays?.[0] || {};
+  const meter = cloudData.meters?.[0] || {};
+  const relay = cloudData.relays?.[0] || {};
   return {
     id: device.id,
     name: device.name,
@@ -68,14 +78,18 @@ function parseDeviceData(device: DeviceConfig, data: any) {
     power: meter.power ?? 0,
     total: meter.total ?? 0,
     relayOn: relay.ison ?? false,
-    temperature: data.temperature ?? null,
-    overtemperature: data.overtemperature ?? false,
+    temperature: cloudData.temperature ?? cloudData.tmp?.tC ?? null,
+    overtemperature: cloudData.overtemperature ?? false,
+    updated: cloudData._updated || null,
   };
 }
 
-// Fetch status for all devices
+// Fetch status for all configured devices (single cloud API call)
 app.get("/api/status", async (_req, res) => {
-  const results = await Promise.all(devices.map(fetchDeviceStatus));
+  const cloudStatuses = await fetchAllDeviceStatuses();
+  const results = devices.map(device =>
+    parseDeviceData(device, cloudStatuses.get(device.cloudId))
+  );
   res.json(results);
 });
 
@@ -86,10 +100,13 @@ app.get("/api/status/:id", async (req, res) => {
     res.status(404).json({ error: "Device not found" });
     return;
   }
-  const result = await fetchDeviceStatus(device);
+  const cloudStatuses = await fetchAllDeviceStatuses();
+  const result = parseDeviceData(device, cloudStatuses.get(device.cloudId));
   res.json(result);
 });
 
 app.listen(PORT, () => {
   console.log(`ShellyHome dashboard running at http://localhost:${PORT}`);
+  console.log(`Using Shelly Cloud: ${SHELLY_SERVER_URL}`);
+  console.log(`Monitoring ${devices.length} devices`);
 });
